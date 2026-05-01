@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>BinaryPro Cloud</title>
+    <script src="https://unpkg.com/lightweight-charts@4.0.1/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; }
+        body { font-family: 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; padding: 10px; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .logo { font-size: 20px; font-weight: bold; color: #58a6ff; }
+        .chart-container { width: 100%; height: 300px; margin-bottom: 10px; border-radius: 8px; overflow: hidden; }
+        .trade-buttons { display: flex; gap: 10px; margin: 10px 0; }
+        .btn-call { flex: 1; background: #238636; color: white; padding: 14px; border: none; border-radius: 8px; font-size: 18px; font-weight: bold; cursor: pointer; }
+        .btn-put { flex: 1; background: #da3633; color: white; padding: 14px; border: none; border-radius: 8px; font-size: 18px; font-weight: bold; cursor: pointer; }
+        .timer { text-align: center; font-size: 28px; margin: 8px 0; }
+        .config { background: #161b22; padding: 10px; border-radius: 8px; margin: 10px 0; }
+        .config input, .config select { width: 100%; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 10px; border-radius: 6px; margin-top: 6px; }
+        .log { max-height: 120px; overflow-y: auto; background: #0d1117; padding: 8px; border-radius: 6px; font-family: monospace; font-size: 11px; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="logo">BinaryPro Cloud</div>
+        <span>🤖 <span id="robotStatus">OFF</span></span>
+    </div>
+
+    <div class="chart-container" id="chart"></div>
+
+    <div class="trade-buttons">
+        <button class="btn-call" onclick="executeTrade('CALL')">📈 CALL</button>
+        <button class="btn-put" onclick="executeTrade('PUT')">📉 PUT</button>
+    </div>
+
+    <div class="timer" id="timer">--:--</div>
+
+    <div class="config">
+        <select id="brokerSelect">
+            <option value="quotex">Quotex</option>
+            <option value="pocketoption">Pocket Option</option>
+            <option value="binance">Binance (em breve)</option>
+        </select>
+        <input type="email" id="email" placeholder="E-mail da corretora">
+        <input type="password" id="password" placeholder="Senha">
+        <select id="pairSelect">
+            <option value="BTCUSDT">BTC/USDT</option>
+            <option value="ETHUSDT">ETH/USDT</option>
+        </select>
+        <select id="expirySelect">
+            <option value="1">M1</option>
+            <option value="5">M5</option>
+        </select>
+        <input type="number" id="amount" value="10" placeholder="Valor em USDT">
+    </div>
+
+    <div class="log" id="log"></div>
+
+    <script>
+        let chart, candleSeries;
+        let tradeActive = false, expiryTime, timerInterval;
+
+        const container = document.getElementById('chart');
+        chart = LightweightCharts.createChart(container, {
+            width: container.clientWidth,
+            height: 300,
+            layout: { background: { color: '#0d1117' }, textColor: '#c9d1d9' },
+            grid: { vertLines: { color: '#21262d' }, horzLines: { color: '#21262d' } }
+        });
+        candleSeries = chart.addCandlestickSeries();
+
+        const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_1m');
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            if (!data.k) return;
+            const kline = data.k;
+            const newCandle = {
+                time: Math.floor(kline.t / 1000),
+                open: parseFloat(kline.o),
+                high: parseFloat(kline.h),
+                low: parseFloat(kline.l),
+                close: parseFloat(kline.c)
+            };
+            candleSeries.update(newCandle);
+        };
+
+        async function executeTrade(action) {
+            if (tradeActive) { log('Aguarde a operação atual.'); return; }
+            const broker = document.getElementById('brokerSelect').value;
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            if (!email || !password) { log('Insira e-mail e senha.'); return; }
+            const pair = document.getElementById('pairSelect').value;
+            const amount = parseFloat(document.getElementById('amount').value);
+            const expiry = document.getElementById('expirySelect').value;
+            if (!amount || amount <= 0) { log('Valor inválido.'); return; }
+
+            tradeActive = true;
+            expiryTime = Date.now() + expiry * 60 * 1000;
+            startTimer();
+
+            try {
+                const response = await fetch('/api/trade', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        broker,
+                        credentials: { email, password },
+                        trade: { pair, action, amount, expiry }
+                    })
+                });
+                const data = await response.json();
+                if (data.success) {
+                    log(`${action} enviado à ${broker}.`);
+                } else {
+                    log(`Falha: ${data.message}`);
+                    tradeActive = false;
+                }
+            } catch (e) {
+                log('Erro de conexão com o servidor.');
+                tradeActive = false;
+            }
+        }
+
+        function startTimer() { timerInterval = setInterval(updateTimer, 200); }
+        function updateTimer() {
+            const diff = Math.max(0, expiryTime - Date.now());
+            const m = Math.floor(diff / 60000);
+            const s = Math.floor((diff % 60000) / 1000);
+            document.getElementById('timer').innerText = `${m}:${s.toString().padStart(2, '0')}`;
+            if (diff <= 0) {
+                clearInterval(timerInterval);
+                tradeActive = false;
+                log('Tempo expirado.');
+            }
+        }
+
+        function log(msg) {
+            const el = document.getElementById('log');
+            el.innerHTML = `[${new Date().toLocaleTimeString()}] ${msg}<br>` + el.innerHTML;
+        }
+
+        fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=100')
+            .then(r => r.json())
+            .then(data => {
+                const candles = data.map(k => ({
+                    time: Math.floor(k[0] / 1000),
+                    open: parseFloat(k[1]),
+                    high: parseFloat(k[2]),
+                    low: parseFloat(k[3]),
+                    close: parseFloat(k[4])
+                }));
+                candleSeries.setData(candles);
+                log('Painel carregado.');
+            });
+    </script>
+</body>
+          </html>
