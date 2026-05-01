@@ -68,6 +68,20 @@
         let tradeActive = false, expiryTime, timerInterval;
         let autoTradeEnabled = false;
         let currentPrice = 0;
+        let ws;
+
+        // ========== SONS ==========
+        function playSound(type) {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                osc.type = type === 'CALL' ? 'square' : 'triangle';
+                osc.frequency.value = type === 'CALL' ? 880 : 440;
+                osc.connect(ctx.destination);
+                osc.start();
+                osc.stop(ctx.currentTime + 0.15);
+            } catch(e) {}
+        }
 
         // ========== GRÁFICO E INDICADORES ==========
         const container = document.getElementById('chart');
@@ -82,31 +96,29 @@
             borderUpColor: '#238636', borderDownColor: '#da3633',
             wickUpColor: '#238636', wickDownColor: '#da3633'
         });
-        ema9Series = chart.addLineSeries({ color: '#fbbf24', lineWidth: 1 });
-        ema21Series = chart.addLineSeries({ color: '#60a5fa', lineWidth: 1 });
-        bollUpper = chart.addLineSeries({ color: '#a78bfa', lineWidth: 1, lineStyle: 2 });
+        ema9Series = chart.addLineSeries({ color: '#fbbf24', lineWidth: 1 });   // Amarelo
+        ema21Series = chart.addLineSeries({ color: '#60a5fa', lineWidth: 1 });  // Azul
+        bollUpper = chart.addLineSeries({ color: '#a78bfa', lineWidth: 1, lineStyle: 2 }); // Roxo
         bollLower = chart.addLineSeries({ color: '#a78bfa', lineWidth: 1, lineStyle: 2 });
 
-        // ========== INDICADORES TÉCNICOS ==========
+        // ========== INDICADORES ==========
         function updateIndicators() {
             const data = candleSeries.data();
-            if (!data || data.length < 21) return;
+            if (!data || data.length < 20) return;
             const closes = data.map(c => c.close);
+            const times = data.map(c => c.time);
 
-            // Calcular EMAs
+            // EMA
             const ema9 = calcEMA(closes, 9);
             const ema21 = calcEMA(closes, 21);
-            // Bandas de Bollinger (20 períodos, 2 desvios)
+            if (ema9) ema9Series.setData(ema9.map((v, i) => ({ time: times[i], value: v })));
+            if (ema21) ema21Series.setData(ema21.map((v, i) => ({ time: times[i], value: v })));
+
+            // Bollinger
             const bb = calcBollingerBands(closes, 20, 2);
-
-            const times = data.map(c => c.time);
-            const fmt = (vals) => vals.map((v, i) => ({ time: times[i], value: v }));
-
-            if (ema9) ema9Series.setData(fmt(ema9));
-            if (ema21) ema21Series.setData(fmt(ema21));
             if (bb) {
-                bollUpper.setData(fmt(bb.upper));
-                bollLower.setData(fmt(bb.lower));
+                bollUpper.setData(bb.upper.map((v, i) => ({ time: times[i], value: v })));
+                bollLower.setData(bb.lower.map((v, i) => ({ time: times[i], value: v })));
             }
         }
 
@@ -136,81 +148,81 @@
             return { upper, lower };
         }
 
-        // ========== WEBSOCKET PREÇO REAL ==========
-        const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_1m');
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            if (!data.k) return;
-            const kline = data.k;
-            const newCandle = {
-                time: Math.floor(kline.t / 1000),
-                open: parseFloat(kline.o),
-                high: parseFloat(kline.h),
-                low: parseFloat(kline.l),
-                close: parseFloat(kline.c)
+        // ========== WEBSOCKET ==========
+        function connectWebSocket() {
+            ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_1m');
+            ws.onopen = () => log('Conectado ao feed de preços.');
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (!data.k) return;
+                const kline = data.k;
+                const newCandle = {
+                    time: Math.floor(kline.t / 1000),
+                    open: parseFloat(kline.o),
+                    high: parseFloat(kline.h),
+                    low: parseFloat(kline.l),
+                    close: parseFloat(kline.c)
+                };
+                candleSeries.update(newCandle);
+                currentPrice = newCandle.close;
+                updateIndicators();
+
+                if (autoTradeEnabled && !tradeActive) autoAnalyze();
+                if (tradeActive) updateTimer();
             };
-            candleSeries.update(newCandle);
-            currentPrice = newCandle.close;
-            updateIndicators();
+            ws.onerror = () => log('Erro no WebSocket.');
+            ws.onclose = () => {
+                log('WebSocket fechado. Reconectando em 5s...');
+                setTimeout(connectWebSocket, 5000);
+            };
+        }
 
-            // Robô automático
-            if (autoTradeEnabled && !tradeActive) {
-                autoAnalyze();
-            }
-
-            // Timer da ordem ativa
-            if (tradeActive) updateTimer();
-        };
-
-        // ========== ROBÔ AUTOMÁTICO ==========
+        // ========== ROBÔ ==========
         function autoAnalyze() {
             const data = candleSeries.data();
             if (!data || data.length < 21) return;
             const closes = data.map(c => c.close);
-
             const ema9 = calcEMA(closes, 9);
             const ema21 = calcEMA(closes, 21);
             if (!ema9 || !ema21 || ema9.length < 2 || ema21.length < 2) return;
 
-            const lastEma9 = ema9[ema9.length - 1];
-            const lastEma21 = ema21[ema21.length - 1];
-            const prevEma9 = ema9[ema9.length - 2];
-            const prevEma21 = ema21[ema21.length - 2];
+            const last9 = ema9[ema9.length-1], last21 = ema21[ema21.length-1];
+            const prev9 = ema9[ema9.length-2], prev21 = ema21[ema21.length-2];
 
-            // Cruzamento de EMAs
             let sinal = null;
-            if (prevEma9 <= prevEma21 && lastEma9 > lastEma21) sinal = 'CALL';
-            else if (prevEma9 >= prevEma21 && lastEma9 < lastEma21) sinal = 'PUT';
+            if (prev9 <= prev21 && last9 > last21) sinal = 'CALL';
+            else if (prev9 >= prev21 && last9 < last21) sinal = 'PUT';
             if (!sinal) return;
 
-            // Filtro Bollinger (opcional)
+            // Filtro Bollinger
             const bb = calcBollingerBands(closes, 20, 2);
             if (bb) {
-                const lastUpper = bb.upper[bb.upper.length - 1];
-                const lastLower = bb.lower[bb.lower.length - 1];
+                const lastUpper = bb.upper[bb.upper.length-1];
+                const lastLower = bb.lower[bb.lower.length-1];
                 if (currentPrice >= lastUpper || currentPrice <= lastLower) {
-                    log('Robô: fora das bandas, aguardando.');
+                    log('Sinal ' + sinal + ' ignorado (preço nas bandas).');
                     return;
                 }
             }
 
-            log(`Robô: sinal ${sinal} detectado.`);
+            log('Sinal ' + sinal + ' detectado. Executando...');
             executeTrade(sinal);
         }
 
-        // ========== EXECUTAR ORDEM (MANUAL OU ROBÔ) ==========
+        // ========== TRADING ==========
         async function executeTrade(action) {
-            if (tradeActive) { log('Aguarde a operação atual.'); return; }
+            if (tradeActive) return;
             const broker = document.getElementById('brokerSelect').value;
             const email = document.getElementById('email').value.trim();
             const password = document.getElementById('password').value.trim();
-            if (!email || !password) { log('Insira e-mail e senha para conectar à corretora.'); return; }
-            const pair = document.getElementById('pairSelect').value;
+            if (!email || !password) { log('Preencha e-mail e senha.'); return; }
             const amount = parseFloat(document.getElementById('amount').value);
             const expiry = document.getElementById('expirySelect').value;
             if (!amount || amount <= 0) { log('Valor inválido.'); return; }
 
-            // Enviar para o servidor (que por enquanto simula, mas o mecanismo está pronto)
+            playSound(action);
+            log(`Ordem ${action} enviada (simulação).`);
+
             try {
                 const response = await fetch('/api/trade', {
                     method: 'POST',
@@ -218,22 +230,19 @@
                     body: JSON.stringify({
                         broker,
                         credentials: { email, password },
-                        trade: { pair, action, amount, expiry }
+                        trade: { pair: document.getElementById('pairSelect').value, action, amount, expiry }
                     })
                 });
                 const data = await response.json();
-                if (data.success) {
-                    log(`Ordem ${action} enviada à ${broker}.`);
-                    // Iniciar timer localmente
-                    tradeActive = true;
-                    expiryTime = Date.now() + expiry * 60 * 1000;
-                    startTimer();
-                } else {
-                    log(`Erro: ${data.message}`);
-                }
-            } catch (e) {
-                log('Servidor offline. Ordem não executada.');
+                if (data.success) log('Servidor respondeu: ' + data.message);
+                else log('Erro do servidor: ' + data.message);
+            } catch(e) {
+                log('Servidor offline. Ordem local simulada.');
             }
+
+            tradeActive = true;
+            expiryTime = Date.now() + expiry * 60 * 1000;
+            startTimer();
         }
 
         function startTimer() { timerInterval = setInterval(updateTimer, 200); }
@@ -252,7 +261,7 @@
         function toggleAutoTrade() {
             autoTradeEnabled = document.getElementById('autoTrade').checked;
             document.getElementById('robotStatus').innerText = autoTradeEnabled ? 'LIGADO' : 'OFF';
-            log(autoTradeEnabled ? 'Robô automático ativado.' : 'Robô automático desativado.');
+            log(autoTradeEnabled ? 'Robô ativado.' : 'Robô desativado.');
         }
 
         function log(msg) {
@@ -260,7 +269,7 @@
             el.innerHTML = `[${new Date().toLocaleTimeString()}] ${msg}<br>` + el.innerHTML;
         }
 
-        // Carregar velas históricas
+        // ========== CARREGAR DADOS INICIAIS ==========
         fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=100')
             .then(r => r.json())
             .then(data => {
@@ -273,8 +282,11 @@
                 }));
                 candleSeries.setData(candles);
                 updateIndicators();
-                log('Painel carregado. Selecione corretora e ative o robô.');
+                log('Painel pronto. Ative o robô.');
             });
+
+        // Iniciar WebSocket
+        connectWebSocket();
     </script>
 </body>
-</html>
+            </html>
