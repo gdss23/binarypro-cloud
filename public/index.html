@@ -18,6 +18,7 @@
         .config { background: #161b22; padding: 10px; border-radius: 8px; margin: 10px 0; }
         .config input, .config select { width: 100%; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 10px; border-radius: 6px; margin-top: 6px; }
         .log { max-height: 120px; overflow-y: auto; background: #0d1117; padding: 8px; border-radius: 6px; font-family: monospace; font-size: 11px; margin-top: 10px; }
+        .switch { display: flex; align-items: center; gap: 8px; }
     </style>
 </head>
 <body>
@@ -36,6 +37,7 @@
     <div class="timer" id="timer">--:--</div>
 
     <div class="config">
+        <div>🔌 Corretora</div>
         <select id="brokerSelect">
             <option value="quotex">Quotex</option>
             <option value="pocketoption">Pocket Option</option>
@@ -52,14 +54,21 @@
             <option value="5">M5</option>
         </select>
         <input type="number" id="amount" value="10" placeholder="Valor em USDT">
+        <div class="switch" style="margin-top:8px;">
+            <label>🤖 Robô Automático</label>
+            <input type="checkbox" id="autoTrade" onchange="toggleAutoTrade()">
+        </div>
     </div>
 
     <div class="log" id="log"></div>
 
     <script>
-        let chart, candleSeries;
+        // ========== VARIÁVEIS ==========
+        let chart, candleSeries, ema9Series, ema21Series, bollUpper, bollLower;
         let tradeActive = false, expiryTime, timerInterval;
+        let autoTradeEnabled = false;
 
+        // ========== GRÁFICO ==========
         const container = document.getElementById('chart');
         chart = LightweightCharts.createChart(container, {
             width: container.clientWidth,
@@ -68,7 +77,12 @@
             grid: { vertLines: { color: '#21262d' }, horzLines: { color: '#21262d' } }
         });
         candleSeries = chart.addCandlestickSeries();
+        ema9Series = chart.addLineSeries({ color: '#fbbf24', lineWidth: 1 });
+        ema21Series = chart.addLineSeries({ color: '#60a5fa', lineWidth: 1 });
+        bollUpper = chart.addLineSeries({ color: '#a78bfa', lineWidth: 1, lineStyle: 2 });
+        bollLower = chart.addLineSeries({ color: '#a78bfa', lineWidth: 1, lineStyle: 2 });
 
+        // ========== WEBSOCKET ==========
         const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_1m');
         ws.onmessage = (event) => {
             const data = JSON.parse(event.data);
@@ -82,8 +96,47 @@
                 close: parseFloat(kline.c)
             };
             candleSeries.update(newCandle);
+            updateIndicators();
         };
 
+        // ========== INDICADORES ==========
+        function updateIndicators() {
+            const closes = candleSeries.data().map(c => c.close);
+            if (closes.length < 21) return;
+            const calcEMA = (data, p) => {
+                const k = 2 / (p + 1);
+                let ema = data.slice(0, p).reduce((a, b) => a + b, 0) / p;
+                const res = [ema];
+                for (let i = p; i < data.length; i++) {
+                    ema = data[i] * k + ema * (1 - k);
+                    res.push(ema);
+                }
+                return res;
+            };
+            const ema9 = calcEMA(closes, 9);
+            const ema21 = calcEMA(closes, 21);
+            const calcBB = (data, period, mult) => {
+                const upper = [], lower = [];
+                for (let i = period - 1; i < data.length; i++) {
+                    const slice = data.slice(i - period + 1, i + 1);
+                    const mean = slice.reduce((a, b) => a + b, 0) / period;
+                    const variance = slice.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / period;
+                    const std = Math.sqrt(variance);
+                    upper.push(mean + mult * std);
+                    lower.push(mean - mult * std);
+                }
+                return { upper, lower };
+            };
+            const bb = calcBB(closes, 20, 2);
+            const times = candleSeries.data().map(c => c.time);
+            const fmt = (vals) => vals.map((v, i) => ({ time: times[i], value: v }));
+            ema9Series.setData(fmt(ema9));
+            ema21Series.setData(fmt(ema21));
+            bollUpper.setData(fmt(bb.upper));
+            bollLower.setData(fmt(bb.lower));
+        }
+
+        // ========== TRADING ==========
         async function executeTrade(action) {
             if (tradeActive) { log('Aguarde a operação atual.'); return; }
             const broker = document.getElementById('brokerSelect').value;
@@ -135,11 +188,18 @@
             }
         }
 
+        function toggleAutoTrade() {
+            autoTradeEnabled = document.getElementById('autoTrade').checked;
+            document.getElementById('robotStatus').innerText = autoTradeEnabled ? 'LIGADO' : 'OFF';
+            log(autoTradeEnabled ? 'Robô ativado.' : 'Robô desativado.');
+        }
+
         function log(msg) {
             const el = document.getElementById('log');
             el.innerHTML = `[${new Date().toLocaleTimeString()}] ${msg}<br>` + el.innerHTML;
         }
 
+        // Carregar velas históricas
         fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=100')
             .then(r => r.json())
             .then(data => {
@@ -151,8 +211,9 @@
                     close: parseFloat(k[4])
                 }));
                 candleSeries.setData(candles);
-                log('Painel carregado.');
+                updateIndicators();
+                log('Painel carregado. Conecte sua corretora.');
             });
     </script>
 </body>
-          </html>
+                </html>
