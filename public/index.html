@@ -67,8 +67,9 @@
         let chart, candleSeries, ema9Series, ema21Series, bollUpper, bollLower;
         let tradeActive = false, expiryTime, timerInterval;
         let autoTradeEnabled = false;
+        let currentPrice = 0;
 
-        // ========== GRÁFICO ==========
+        // ========== GRÁFICO E INDICADORES ==========
         const container = document.getElementById('chart');
         chart = LightweightCharts.createChart(container, {
             width: container.clientWidth,
@@ -76,13 +77,66 @@
             layout: { background: { color: '#0d1117' }, textColor: '#c9d1d9' },
             grid: { vertLines: { color: '#21262d' }, horzLines: { color: '#21262d' } }
         });
-        candleSeries = chart.addCandlestickSeries();
+        candleSeries = chart.addCandlestickSeries({
+            upColor: '#238636', downColor: '#da3633',
+            borderUpColor: '#238636', borderDownColor: '#da3633',
+            wickUpColor: '#238636', wickDownColor: '#da3633'
+        });
         ema9Series = chart.addLineSeries({ color: '#fbbf24', lineWidth: 1 });
         ema21Series = chart.addLineSeries({ color: '#60a5fa', lineWidth: 1 });
         bollUpper = chart.addLineSeries({ color: '#a78bfa', lineWidth: 1, lineStyle: 2 });
         bollLower = chart.addLineSeries({ color: '#a78bfa', lineWidth: 1, lineStyle: 2 });
 
-        // ========== WEBSOCKET ==========
+        // ========== INDICADORES TÉCNICOS ==========
+        function updateIndicators() {
+            const data = candleSeries.data();
+            if (!data || data.length < 21) return;
+            const closes = data.map(c => c.close);
+
+            // Calcular EMAs
+            const ema9 = calcEMA(closes, 9);
+            const ema21 = calcEMA(closes, 21);
+            // Bandas de Bollinger (20 períodos, 2 desvios)
+            const bb = calcBollingerBands(closes, 20, 2);
+
+            const times = data.map(c => c.time);
+            const fmt = (vals) => vals.map((v, i) => ({ time: times[i], value: v }));
+
+            if (ema9) ema9Series.setData(fmt(ema9));
+            if (ema21) ema21Series.setData(fmt(ema21));
+            if (bb) {
+                bollUpper.setData(fmt(bb.upper));
+                bollLower.setData(fmt(bb.lower));
+            }
+        }
+
+        function calcEMA(data, period) {
+            if (data.length < period) return null;
+            const k = 2 / (period + 1);
+            let ema = data.slice(0, period).reduce((a, b) => a + b, 0) / period;
+            const result = [ema];
+            for (let i = period; i < data.length; i++) {
+                ema = data[i] * k + ema * (1 - k);
+                result.push(ema);
+            }
+            return result;
+        }
+
+        function calcBollingerBands(data, period, mult) {
+            if (data.length < period) return null;
+            const upper = [], lower = [];
+            for (let i = period - 1; i < data.length; i++) {
+                const slice = data.slice(i - period + 1, i + 1);
+                const mean = slice.reduce((a, b) => a + b, 0) / period;
+                const variance = slice.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / period;
+                const std = Math.sqrt(variance);
+                upper.push(mean + mult * std);
+                lower.push(mean - mult * std);
+            }
+            return { upper, lower };
+        }
+
+        // ========== WEBSOCKET PREÇO REAL ==========
         const ws = new WebSocket('wss://stream.binance.com:9443/ws/btcusdt@kline_1m');
         ws.onmessage = (event) => {
             const data = JSON.parse(event.data);
@@ -96,62 +150,67 @@
                 close: parseFloat(kline.c)
             };
             candleSeries.update(newCandle);
+            currentPrice = newCandle.close;
             updateIndicators();
+
+            // Robô automático
+            if (autoTradeEnabled && !tradeActive) {
+                autoAnalyze();
+            }
+
+            // Timer da ordem ativa
+            if (tradeActive) updateTimer();
         };
 
-        // ========== INDICADORES ==========
-        function updateIndicators() {
-            const closes = candleSeries.data().map(c => c.close);
-            if (closes.length < 21) return;
-            const calcEMA = (data, p) => {
-                const k = 2 / (p + 1);
-                let ema = data.slice(0, p).reduce((a, b) => a + b, 0) / p;
-                const res = [ema];
-                for (let i = p; i < data.length; i++) {
-                    ema = data[i] * k + ema * (1 - k);
-                    res.push(ema);
-                }
-                return res;
-            };
+        // ========== ROBÔ AUTOMÁTICO ==========
+        function autoAnalyze() {
+            const data = candleSeries.data();
+            if (!data || data.length < 21) return;
+            const closes = data.map(c => c.close);
+
             const ema9 = calcEMA(closes, 9);
             const ema21 = calcEMA(closes, 21);
-            const calcBB = (data, period, mult) => {
-                const upper = [], lower = [];
-                for (let i = period - 1; i < data.length; i++) {
-                    const slice = data.slice(i - period + 1, i + 1);
-                    const mean = slice.reduce((a, b) => a + b, 0) / period;
-                    const variance = slice.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / period;
-                    const std = Math.sqrt(variance);
-                    upper.push(mean + mult * std);
-                    lower.push(mean - mult * std);
+            if (!ema9 || !ema21 || ema9.length < 2 || ema21.length < 2) return;
+
+            const lastEma9 = ema9[ema9.length - 1];
+            const lastEma21 = ema21[ema21.length - 1];
+            const prevEma9 = ema9[ema9.length - 2];
+            const prevEma21 = ema21[ema21.length - 2];
+
+            // Cruzamento de EMAs
+            let sinal = null;
+            if (prevEma9 <= prevEma21 && lastEma9 > lastEma21) sinal = 'CALL';
+            else if (prevEma9 >= prevEma21 && lastEma9 < lastEma21) sinal = 'PUT';
+            if (!sinal) return;
+
+            // Filtro Bollinger (opcional)
+            const bb = calcBollingerBands(closes, 20, 2);
+            if (bb) {
+                const lastUpper = bb.upper[bb.upper.length - 1];
+                const lastLower = bb.lower[bb.lower.length - 1];
+                if (currentPrice >= lastUpper || currentPrice <= lastLower) {
+                    log('Robô: fora das bandas, aguardando.');
+                    return;
                 }
-                return { upper, lower };
-            };
-            const bb = calcBB(closes, 20, 2);
-            const times = candleSeries.data().map(c => c.time);
-            const fmt = (vals) => vals.map((v, i) => ({ time: times[i], value: v }));
-            ema9Series.setData(fmt(ema9));
-            ema21Series.setData(fmt(ema21));
-            bollUpper.setData(fmt(bb.upper));
-            bollLower.setData(fmt(bb.lower));
+            }
+
+            log(`Robô: sinal ${sinal} detectado.`);
+            executeTrade(sinal);
         }
 
-        // ========== TRADING ==========
+        // ========== EXECUTAR ORDEM (MANUAL OU ROBÔ) ==========
         async function executeTrade(action) {
             if (tradeActive) { log('Aguarde a operação atual.'); return; }
             const broker = document.getElementById('brokerSelect').value;
-            const email = document.getElementById('email').value;
-            const password = document.getElementById('password').value;
-            if (!email || !password) { log('Insira e-mail e senha.'); return; }
+            const email = document.getElementById('email').value.trim();
+            const password = document.getElementById('password').value.trim();
+            if (!email || !password) { log('Insira e-mail e senha para conectar à corretora.'); return; }
             const pair = document.getElementById('pairSelect').value;
             const amount = parseFloat(document.getElementById('amount').value);
             const expiry = document.getElementById('expirySelect').value;
             if (!amount || amount <= 0) { log('Valor inválido.'); return; }
 
-            tradeActive = true;
-            expiryTime = Date.now() + expiry * 60 * 1000;
-            startTimer();
-
+            // Enviar para o servidor (que por enquanto simula, mas o mecanismo está pronto)
             try {
                 const response = await fetch('/api/trade', {
                     method: 'POST',
@@ -164,14 +223,16 @@
                 });
                 const data = await response.json();
                 if (data.success) {
-                    log(`${action} enviado à ${broker}.`);
+                    log(`Ordem ${action} enviada à ${broker}.`);
+                    // Iniciar timer localmente
+                    tradeActive = true;
+                    expiryTime = Date.now() + expiry * 60 * 1000;
+                    startTimer();
                 } else {
-                    log(`Falha: ${data.message}`);
-                    tradeActive = false;
+                    log(`Erro: ${data.message}`);
                 }
             } catch (e) {
-                log('Erro de conexão com o servidor.');
-                tradeActive = false;
+                log('Servidor offline. Ordem não executada.');
             }
         }
 
@@ -184,14 +245,14 @@
             if (diff <= 0) {
                 clearInterval(timerInterval);
                 tradeActive = false;
-                log('Tempo expirado.');
+                log('Operação encerrada.');
             }
         }
 
         function toggleAutoTrade() {
             autoTradeEnabled = document.getElementById('autoTrade').checked;
             document.getElementById('robotStatus').innerText = autoTradeEnabled ? 'LIGADO' : 'OFF';
-            log(autoTradeEnabled ? 'Robô ativado.' : 'Robô desativado.');
+            log(autoTradeEnabled ? 'Robô automático ativado.' : 'Robô automático desativado.');
         }
 
         function log(msg) {
@@ -212,8 +273,8 @@
                 }));
                 candleSeries.setData(candles);
                 updateIndicators();
-                log('Painel carregado. Conecte sua corretora.');
+                log('Painel carregado. Selecione corretora e ative o robô.');
             });
     </script>
 </body>
-                </html>
+</html>
